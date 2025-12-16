@@ -1,0 +1,373 @@
+# MarkiTek OpsCam - Deployment Guide
+
+Complete setup guide for deploying the OpsCam monitoring system on your VPS.
+
+## Prerequisites
+
+- Ubuntu 22.04+ VPS
+- Docker & Docker Compose installed
+- PostgreSQL running (you have this)
+- n8n running (you have this)
+- Domain: `ops.markiteklabs.com` pointed to your VPS
+- SSL certificate (Let’s Encrypt recommended)
+
+## 1. Check VPS Resources
+
+```bash
+# Check CPU and RAM
+nproc && free -h
+
+# Check disk space
+df -h
+
+# Recommended minimums for 4 cameras:
+# - 4 CPU cores
+# - 8GB RAM
+# - 100GB storage for clips/snapshots
+```
+
+## 2. Directory Setup
+
+```bash
+# Create application directory
+sudo mkdir -p /opt/markitek/opscam
+sudo chown $USER:$USER /opt/markitek/opscam
+
+# Clone/copy files
+cd /opt/markitek/opscam
+# Copy all files from this package to this directory
+```
+
+## 3. Environment Configuration
+
+```bash
+cd /opt/markitek/opscam/docker
+
+# Copy and edit environment file
+cp .env.example .env
+nano .env
+```
+
+**Generate secure passwords:**
+
+```bash
+# Generate random passwords
+openssl rand -base64 32  # For MINIO_ROOT_PASSWORD
+openssl rand -base64 32  # For MQTT_PASSWORD
+openssl rand -base64 32  # For REDIS_PASSWORD
+openssl rand -base64 32  # For NEXTAUTH_SECRET
+openssl rand -base64 32  # For WP_JWT_SECRET
+```
+
+## 4. PostgreSQL Database Setup
+
+```bash
+# Connect to your existing PostgreSQL
+psql -U your_admin_user -d postgres
+
+# Create database and user
+CREATE DATABASE opscam;
+CREATE USER opscam_user WITH ENCRYPTED PASSWORD 'your-secure-password';
+GRANT ALL PRIVILEGES ON DATABASE opscam TO opscam_user;
+\c opscam
+GRANT ALL ON SCHEMA public TO opscam_user;
+
+# Exit psql and run schema
+\q
+
+psql -U opscam_user -d opscam -f /opt/markitek/opscam/database/schema.sql
+```
+
+## 5. MQTT Password Setup
+
+```bash
+cd /opt/markitek/opscam/docker/mosquitto
+
+# Create password file
+docker run -it --rm -v $(pwd):/mosquitto/config eclipse-mosquitto:2 \
+  mosquitto_passwd -c /mosquitto/config/passwd opscam
+
+# Enter your MQTT_PASSWORD when prompted
+```
+
+## 6. Frigate Configuration
+
+Edit the Frigate config with your camera details:
+
+```bash
+nano /opt/markitek/opscam/docker/frigate/config.yml
+```
+
+**Replace placeholders:**
+
+- `{FRIGATE_MQTT_USER}` → `opscam`
+- `{FRIGATE_MQTT_PASSWORD}` → Your MQTT password
+- `{FRIGATE_RTSP_USER}` → Your camera username
+- `{FRIGATE_RTSP_PASSWORD}` → Your camera password
+- `{CAM_FRONT_IP}`, etc. → Your camera IP addresses
+
+**For cameras not yet installed**, comment out the go2rtc streams and camera definitions you’re not using.
+
+## 7. Start Docker Services
+
+```bash
+cd /opt/markitek/opscam/docker
+
+# Pull images
+docker compose pull
+
+# Start services
+docker compose up -d
+
+# Check logs
+docker compose logs -f
+
+# Verify all services are healthy
+docker compose ps
+```
+
+## 8. MinIO Initial Setup
+
+Access MinIO console (via SSH tunnel for now):
+
+```bash
+# Create SSH tunnel
+ssh -L 9001:localhost:9001 your-vps
+
+# Access http://localhost:9001 in browser
+# Login with MINIO_ROOT_USER and MINIO_ROOT_PASSWORD
+```
+
+Buckets should be auto-created by the init container. Verify:
+
+- `opscam-clips`
+- `opscam-snapshots`
+- `opscam-backups`
+
+## 9. WordPress JWT Plugin Setup
+
+Install the JWT Authentication plugin on your WordPress site:
+
+1. Install plugin: “JWT Authentication for WP REST API”
+1. Add to `wp-config.php`:
+
+```php
+define('JWT_AUTH_SECRET_KEY', 'your-wp-jwt-secret-from-env');
+define('JWT_AUTH_CORS_ENABLE', true);
+```
+
+1. Add to `.htaccess` (before WordPress rules):
+
+```apache
+RewriteEngine on
+RewriteCond %{HTTP:Authorization} ^(.*)
+RewriteRule ^(.*) - [E=HTTP_AUTHORIZATION:%1]
+SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+```
+
+1. Test JWT endpoint:
+
+```bash
+curl -X POST https://markiteklabs.com/wp-json/jwt-auth/v1/token \
+  -d "username=your-wp-user&password=your-wp-password"
+```
+
+## 10. Deploy Ops UI (Next.js)
+
+```bash
+cd /opt/markitek/opscam/ops-ui
+
+# Install dependencies
+npm install
+
+# Build for production
+npm run build
+
+# Option A: Run with PM2
+npm install -g pm2
+pm2 start npm --name "opscam-ui" -- start
+pm2 save
+pm2 startup
+
+# Option B: Run with Docker (create Dockerfile)
+docker build -t markitek-opscam-ui .
+docker run -d --name opscam-ui \
+  --env-file /opt/markitek/opscam/docker/.env \
+  -p 127.0.0.1:3000:3000 \
+  markitek-opscam-ui
+```
+
+## 11. Nginx Reverse Proxy
+
+```bash
+sudo nano /etc/nginx/sites-available/ops.markiteklabs.com
+```
+
+```nginx
+server {
+    listen 80;
+    server_name ops.markiteklabs.com;
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ops.markiteklabs.com;
+
+    ssl_certificate /etc/letsencrypt/live/ops.markiteklabs.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ops.markiteklabs.com/privkey.pem;
+
+    # Security headers
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Ops UI
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    # MinIO Console (optional, restrict access)
+    location /minio/ {
+        proxy_pass http://127.0.0.1:9001/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/ops.markiteklabs.com /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+## 12. Import n8n Workflows
+
+In your n8n instance:
+
+1. Go to Settings → Credentials
+1. Create credentials:
+- **PostgreSQL** (name: “OpsCam PostgreSQL”)
+- **S3** (name: “OpsCam MinIO”) - use MinIO endpoint `http://minio:9000`
+1. Import workflows:
+- `n8n-workflows/event-backup.json`
+- `n8n-workflows/health-check.json`
+- `n8n-workflows/storage-forecasting.json`
+1. Activate all workflows
+
+## 13. Tailscale VPN Setup
+
+For secure live view access:
+
+```bash
+# Install Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# Authenticate
+sudo tailscale up --authkey=tskey-auth-xxxxx
+
+# Get your Tailscale IP
+tailscale ip -4
+
+# Update Frigate access to use Tailscale hostname
+# Live view URL: http://your-vps.your-tailnet.ts.net:5000
+```
+
+**Important:** Frigate’s web UI (port 5000) is only bound to localhost. Access it via:
+
+- SSH tunnel: `ssh -L 5000:localhost:5000 your-vps`
+- Tailscale: After setup, access via Tailscale IP
+
+## 14. Testing Checklist
+
+- [ ] Docker services all healthy: `docker compose ps`
+- [ ] MinIO console accessible
+- [ ] PostgreSQL schema created: `psql -c "SELECT * FROM opscam.cameras;"`
+- [ ] n8n workflows imported and active
+- [ ] Ops UI accessible at `https://ops.markiteklabs.com`
+- [ ] WordPress JWT auth working
+- [ ] Health check workflow running (check `opscam.system_health` table)
+
+## 15. Adding Cameras (When Ready)
+
+1. Get camera RTSP URL (usually `rtsp://user:pass@ip:554/stream1`)
+1. Update `/opt/markitek/opscam/docker/frigate/config.yml`
+1. Restart Frigate: `docker compose restart frigate`
+1. Verify in Frigate UI via SSH tunnel
+
+## Maintenance Commands
+
+```bash
+# View logs
+docker compose logs -f frigate
+docker compose logs -f minio
+
+# Restart services
+docker compose restart
+
+# Update images
+docker compose pull
+docker compose up -d
+
+# Database backup
+pg_dump -U opscam_user opscam > opscam_backup_$(date +%Y%m%d).sql
+
+# Check storage usage
+docker exec minio mc du local/opscam-clips
+docker exec minio mc du local/opscam-snapshots
+```
+
+## Troubleshooting
+
+### Frigate not detecting cameras
+
+- Check RTSP URL is correct
+- Verify camera is accessible: `ffprobe rtsp://...`
+- Check Frigate logs: `docker compose logs frigate`
+
+### MQTT connection issues
+
+- Verify password file: `docker exec mosquitto cat /mosquitto/config/passwd`
+- Test connection: `mosquitto_sub -h localhost -p 1883 -u opscam -P yourpass -t '#'`
+
+### n8n workflows failing
+
+- Check n8n execution logs
+- Verify credentials are configured
+- Ensure PostgreSQL and MinIO are accessible from n8n network
+
+### WordPress auth not working
+
+- Verify JWT secret matches in both WordPress and .env
+- Check WordPress plugin is activated
+- Test token endpoint directly
+
+-----
+
+## Security Notes
+
+1. **No public camera feeds** - All live view access requires VPN
+1. **Audit logging** - All actions are logged to `opscam.audit_log`
+1. **Session management** - 24-hour JWT expiry
+1. **Network isolation** - Services only bind to localhost
+1. **Rate limiting** - Consider adding nginx rate limiting for API routes
+
+## Support
+
+For issues specific to this deployment, check:
+
+- Docker logs: `docker compose logs`
+- Ops UI logs: `pm2 logs opscam-ui`
+- PostgreSQL: `tail -f /var/log/postgresql/postgresql-*-main.log`
